@@ -1,0 +1,929 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import QRCode from 'qrcode';
+import { FilesetResolver, HandLandmarker, FaceLandmarker } from '@mediapipe/tasks-vision';
+import { collaborationConfigured, createRoom as createSharedRoom, joinRoom as joinSharedRoom, leaveRoom as leaveSharedRoom, onRoomEvent, loadRoomState, publishRoomState, getActiveRoom } from './collaboration.js';
+
+// Zappar's standalone Three.js wrapper expects a global THREE namespace.
+window.THREE = THREE;
+let zapparSdkPromise = null;
+
+function ensureZapparSdk() {
+  if (window.ZapparThree) return Promise.resolve(window.ZapparThree);
+  if (zapparSdkPromise) return zapparSdkPromise;
+  zapparSdkPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://libs.zappar.com/zappar-threejs/4.3.0/zappar-threejs.js';
+    script.async = true;
+    script.onload = () => window.ZapparThree
+      ? resolve(window.ZapparThree)
+      : reject(new Error('Zappar SDK loaded without its browser API.'));
+    script.onerror = () => reject(new Error('Could not download the Zappar SDK.'));
+    document.head.append(script);
+  });
+  return zapparSdkPromise;
+}
+
+const zapparSdkPreload = ensureZapparSdk().catch((error) => { console.warn('Zappar SDK preload failed:', error); return null; });
+
+const $ = (s) => document.querySelector(s);
+const homeScreen = $('#homeScreen'), howScreen = $('#howScreen'), labScreen = $('#labScreen');
+const video = $('#cameraVideo'), threeCanvas = $('#threeCanvas'), faceCanvas = $('#faceCanvas');
+const cameraMessage = $('#cameraMessage'), cameraLabel = $('#cameraLabel'), gestureHint = $('#gestureHint');
+const toastEl = $('#toast');
+
+let stream = null, cameraFacing = 'environment', currentMode = 'hologram', currentObject = 'robot';
+let handLandmarker = null, faceLandmarker = null, gestureOn = false, lastDetect = 0, lastFaceDetect = 0;
+let selectedEffect = 'visor', soundOn = false, handWasPinching = false, grabbed = false;
+let handTarget = new THREE.Vector3(0, 0, 0), isDragging = false, lastPinch = 0;
+let scene, camera, renderer, activeGroup, modelRoot, animationId, autoRotate = true;
+let activeMixer = null, modelMixers = [], modelGroups = {}, fullscreenFallbackActive = false;
+let handLastPoint = null, handLastPalm = null, handLastTime = 0, twoHandBaseline = null;
+let zapparCamera = null, worldTracker = null, worldAnchorGroup = null;
+let worldArSession = null, worldArHitTestSource = null, worldArLocalSpace = null, worldArReticle = null, worldARMode = null;
+let worldARActive = false, worldARPlaced = false;
+let activeModelLoadToken = 0, roomPublishTimer = null, applyingRemoteState = false;
+const gltfLoader = new GLTFLoader();
+const optionalModelFiles = {
+  robot: 'robot.glb',
+  car: 'cybertruck.glb',
+  mars: 'mars.glb',
+  moon: 'moon.glb',
+  satellite: 'satellite.glb',
+  falcon9: 'falcon9-heavy.glb',
+  spacex: 'spacex-big-falcon.glb'
+};
+const modelMetadata = {
+  robot: { label: 'Animated humanoid robot', rotation: [-Math.PI / 2, 0, 0] },
+  car: { label: 'Tesla Cybertruck', rotation: [0, Math.PI / 2, 0] },
+  mars: { label: 'Planet Mars', rotation: [0, 0, 0] },
+  moon: { label: 'Moon with lunar surface texture', rotation: [0, 0, 0] },
+  satellite: { label: 'Mars Space Station', rotation: [-Math.PI / 2, 0, 0] },
+  falcon9: { label: 'Falcon 9 Heavy', rotation: [0, 0, 0] },
+  spacex: { label: 'SpaceX Big Falcon Rocket', rotation: [0, 0, 0] }
+};
+const clock = new THREE.Clock();
+
+function toast(message) {
+  toastEl.textContent = message; toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), 2600);
+}
+function showScreen(screen) {
+  [homeScreen, howScreen, labScreen].forEach(s => s.classList.add('hidden'));
+  screen.classList.remove('hidden');
+}
+$('#startBtn').addEventListener('click', () => { showScreen(labScreen); startCamera(); });
+$('#howBtn').addEventListener('click', () => showScreen(howScreen));
+document.querySelectorAll('[data-back]').forEach(b => b.addEventListener('click', () => showScreen(homeScreen)));
+$('#exitBtn').addEventListener('click', stopExperience);
+$('#cameraStartBtn').addEventListener('click', startCamera);
+$('#worldArBtn').addEventListener('click', startWorldAR);
+$('#placeWorldObjectBtn').addEventListener('click', toggleWorldPlacement);
+$('#stopWorldArBtn').addEventListener('click', () => stopWorldAR());
+$('#createRoomBtn').addEventListener('click', handleCreateRoom);
+$('#joinRoomBtn').addEventListener('click', handleJoinRoom);
+$('#leaveRoomBtn').addEventListener('click', handleLeaveRoom);
+$('#copyRoomLinkBtn').addEventListener('click', copyRoomInvite);
+$('#roomCodeInput').addEventListener('input', (event) => {
+  event.target.value = event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+});
+$('#switchCameraBtn').addEventListener('click', async () => {
+  if (worldARActive) await stopWorldAR({ silent: true });
+  cameraFacing = cameraFacing === 'environment' ? 'user' : 'environment';
+  await startCamera();
+});
+$('#fullscreenBtn').addEventListener('click', toggleStageFullscreen);
+$('#stageFullscreenBtn').addEventListener('click', toggleStageFullscreen);
+document.addEventListener('fullscreenchange', () => {
+  updateFullscreenButtons();
+  resizeThree();
+});
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && fullscreenFallbackActive) exitStageFullscreenFallback();
+});
+
+function stageIsFullscreen() {
+  return fullscreenFallbackActive || document.fullscreenElement === $('#cameraStage');
+}
+function updateFullscreenButtons() {
+  const active = stageIsFullscreen();
+  const bottom = $('#fullscreenBtn');
+  const stage = $('#stageFullscreenBtn');
+  if (bottom) { bottom.textContent = active ? '⤢ EXIT FULL SCREEN' : '⛶ FULL SCREEN'; bottom.setAttribute('aria-pressed', String(active)); }
+  if (stage) { stage.textContent = active ? '⤢ EXIT FULL SCREEN' : '⛶ EXPAND'; stage.setAttribute('aria-pressed', String(active)); }
+}
+updateFullscreenButtons();
+function exitStageFullscreenFallback() {
+  $('#cameraStage')?.classList.remove('is-fullscreen');
+  document.body.classList.remove('fvx-fullscreen-lock');
+  fullscreenFallbackActive = false;
+  updateFullscreenButtons();
+  resizeThree();
+}
+async function toggleStageFullscreen() {
+  const stage = $('#cameraStage');
+  if (stageIsFullscreen()) {
+    if (document.fullscreenElement === stage && document.exitFullscreen) {
+      try { await document.exitFullscreen(); } catch { /* browser may have already exited */ }
+    }
+    if (fullscreenFallbackActive) exitStageFullscreenFallback();
+    updateFullscreenButtons();
+    return;
+  }
+  try {
+    if (!stage.requestFullscreen) throw new Error('Fullscreen API not supported');
+    await stage.requestFullscreen();
+    updateFullscreenButtons();
+  } catch (error) {
+    const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS || !stage.requestFullscreen) {
+      stage.classList.add('is-fullscreen');
+      document.body.classList.add('fvx-fullscreen-lock');
+      fullscreenFallbackActive = true;
+      updateFullscreenButtons();
+      requestAnimationFrame(resizeThree);
+      return;
+    }
+    console.warn('Fullscreen request failed:', error);
+    toast('Fullscreen could not be opened in this browser.');
+  }
+}
+async function leaveStageFullscreen() {
+  const stage = $('#cameraStage');
+  if (document.fullscreenElement === stage && document.exitFullscreen) {
+    try { await document.exitFullscreen(); } catch { /* best effort */ }
+  }
+  if (fullscreenFallbackActive) exitStageFullscreenFallback();
+}
+$('#soundBtn').addEventListener('click', () => { soundOn = !soundOn; $('#soundBtn').style.color = soundOn ? '#53d9ff' : ''; toast(soundOn ? 'Sound effects enabled' : 'Sound effects muted'); });
+$('#rotateBtn').addEventListener('click', () => { autoRotate = !autoRotate; toast(autoRotate ? 'Auto rotation enabled' : 'Auto rotation paused'); scheduleSharedState(); });
+$('#resetBtn').addEventListener('click', () => {
+  if (activeGroup) {
+    activeGroup.position.set(0, worldARActive ? 0.45 : 0, 0);
+    activeGroup.rotation.set(0, 0, 0);
+    activeGroup.scale.setScalar(worldARActive ? 0.35 : 1);
+    $('#scaleSlider').value = 100; $('#scaleValue').textContent = '100%';
+    scheduleSharedState();
+  }
+});
+$('#scaleSlider').addEventListener('input', e => {
+  const v = Number(e.target.value); $('#scaleValue').textContent = `${v}%`;
+  if (activeGroup) activeGroup.scale.setScalar((v / 100) * (worldARActive ? 0.35 : 1));
+  scheduleSharedState();
+});
+document.querySelectorAll('[data-mode]').forEach(btn => btn.addEventListener('click', () => setMode(btn.dataset.mode)));
+document.querySelectorAll('[data-object]').forEach(btn => btn.addEventListener('click', () => selectObject(btn.dataset.object)));
+document.querySelectorAll('[data-effect]').forEach(btn => btn.addEventListener('click', () => {
+  selectedEffect = btn.dataset.effect;
+  document.querySelectorAll('[data-effect]').forEach(b => b.classList.toggle('active', b === btn));
+  toast(selectedEffect === 'none' ? 'Effects cleared' : `${btn.textContent.trim()} selected`);
+}));
+$('#gestureBtn').addEventListener('click', enableGestures);
+$('#spaceXBtn').addEventListener('click', () => selectObject('spacex'));
+$('#carBtn').addEventListener('click', () => selectObject('car'));
+
+async function setMode(mode) {
+  if (worldARActive) await stopWorldAR({ silent: true });
+  currentMode = mode;
+  document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  $('#hologramControls').classList.toggle('hidden', mode !== 'hologram');
+  $('#mirrorControls').classList.toggle('hidden', mode !== 'mirror');
+  $('#stageControls').classList.toggle('hidden', mode !== 'stage');
+  $('#modeTitle').textContent = mode === 'mirror' ? 'FUTURE YOU / AR MIRROR' : mode === 'stage' ? 'THE WORLD OF 2050' : 'HOLOGRAM LAB';
+  if (mode === 'mirror') {
+    cameraFacing = 'user'; startCamera();
+    gestureHint.textContent = 'Look at the camera and try a future filter';
+  } else {
+    cameraFacing = 'environment'; startCamera();
+    gestureHint.textContent = 'Show one hand to the camera to interact';
+  }
+}
+async function stopExperience() {
+  await leaveStageFullscreen();
+  if (worldARActive) await stopWorldAR({ silent: true });
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.srcObject = null; video.classList.remove('hidden'); gestureOn = false;
+  $('#gestureStatus').textContent = 'OFF'; $('#gestureBtn').textContent = 'ENABLE HAND CONTROL';
+  cameraMessage.classList.remove('hidden'); cameraLabel.textContent = 'CAMERA STANDBY';
+  if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+  showScreen(homeScreen);
+}
+async function startCamera() {
+  if (worldARActive) await stopWorldAR({ silent: true });
+  video.classList.remove('hidden');
+  if (!navigator.mediaDevices?.getUserMedia) { toast('Camera requires HTTPS and a modern browser.'); return; }
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: cameraFacing }, width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    video.style.transform = cameraFacing === 'user' ? 'scaleX(-1)' : 'none';
+    await video.play();
+    cameraMessage.classList.add('hidden'); cameraLabel.textContent = cameraFacing === 'user' ? 'FRONT CAMERA ACTIVE' : 'REAR CAMERA ACTIVE';
+    initThree();
+    toast('Camera activated. Welcome to Future Vision XR.');
+    if (currentMode === 'mirror') loadFaceModel();
+    else if (cameraFacing === 'environment' && !gestureOn) enableGestures();
+  } catch (err) {
+    console.error(err);
+    cameraMessage.classList.remove('hidden');
+    toast(err.name === 'NotAllowedError' ? 'Please allow camera access in your browser settings.' : 'Could not start camera. Check permissions and try again.');
+  }
+}
+
+function initThree() {
+  if (renderer && scene && camera && activeGroup) {
+    resizeThree();
+    if (!animationId) animate();
+    return;
+  }
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  camera.position.set(0, 0, 7);
+  renderer = new THREE.WebGLRenderer({ canvas: threeCanvas, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.8));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.setSize(threeCanvas.clientWidth || 800, threeCanvas.clientHeight || 500, false);
+  scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+  const key = new THREE.PointLight(0x64ddff, 45, 30); key.position.set(3, 4, 6); scene.add(key);
+  const fill = new THREE.PointLight(0x256dff, 22, 30); fill.position.set(-4, -2, 4); scene.add(fill);
+  modelRoot = new THREE.Group(); scene.add(modelRoot);
+  buildGallery();
+  window.addEventListener('resize', resizeThree);
+  if (!animationId) animate();
+}
+function resizeThree() {
+  if (!renderer || !camera) return;
+  const w = threeCanvas.clientWidth || 800, h = threeCanvas.clientHeight || 500;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+function mat(color, metalness=0.35, roughness=0.28, emissive=0x071b2a) {
+  return new THREE.MeshStandardMaterial({ color, metalness, roughness, emissive, emissiveIntensity: 0.45 });
+}
+function addMesh(parent, geometry, material, x=0,y=0,z=0) {
+  const m = new THREE.Mesh(geometry, material); m.position.set(x,y,z); parent.add(m); return m;
+}
+function clearGroup(group) {
+  const disposedMaterials = new Set();
+  while (group.children.length) {
+    const child = group.children.pop();
+    child.traverse?.(object => {
+      if (object.geometry) object.geometry.dispose();
+      if (object.material) {
+        (Array.isArray(object.material) ? object.material : [object.material]).forEach(material => {
+          if (!material || disposedMaterials.has(material)) return;
+          disposedMaterials.add(material);
+          for (const value of Object.values(material)) {
+            if (value?.isTexture) value.dispose();
+          }
+          material.dispose();
+        });
+      }
+    });
+  }
+  activeMixer = null;
+}
+const galleryOrder = ['robot','car','mars','moon','satellite','falcon9','spacex'];
+function buildGallery() {
+  if (!modelRoot) return;
+  modelRoot.clear(); modelGroups = {}; modelMixers = [];
+  const radius = worldARActive ? 0.95 : 1.5;
+  galleryOrder.forEach((type, index) => {
+    const group = new THREE.Group();
+    group.userData.modelType = type;
+    const angle = (index / galleryOrder.length) * Math.PI * 2 - Math.PI / 2;
+    group.position.set(Math.cos(angle) * radius, 0, Math.sin(angle) * radius * 0.35);
+    group.scale.setScalar(type === currentObject ? 0.9 : 0.48);
+    modelRoot.add(group); modelGroups[type] = group;
+    const loading = new THREE.Mesh(new THREE.IcosahedronGeometry(0.22, 1), new THREE.MeshBasicMaterial({color:0x53d9ff,wireframe:true}));
+    group.add(loading);
+    loadGalleryModel(type, group);
+  });
+  activeGroup = modelGroups[currentObject];
+  focusSelectedModel();
+  updateCatalogSelection();
+}
+function updateCatalogSelection() {
+  document.querySelectorAll('[data-object]').forEach(button => button.classList.toggle('selected', button.dataset.object === currentObject));
+  const label = modelMetadata[currentObject]?.label || currentObject;
+  if ($('#tipText')) $('#tipText').textContent = `${label} selected. Pinch with your hand to move and rotate.`;
+  if ($('#modelStatus')) $('#modelStatus').textContent = `${galleryOrder.length} 3D objects loaded in the hologram gallery.`;
+}
+function focusSelectedModel() {
+  if (!modelRoot || !activeGroup) return;
+  const radius = worldARActive ? 0.95 : 1.5;
+  const index = galleryOrder.indexOf(currentObject);
+  const angle = (index / galleryOrder.length) * Math.PI * 2 - Math.PI / 2;
+  modelGroups[currentObject].position.set(0, 0, 0);
+  modelGroups[currentObject].scale.setScalar((Number($('#scaleSlider')?.value || 100) / 100) * (worldARActive ? 0.35 : 0.9));
+  galleryOrder.forEach((type, i) => {
+    if (type === currentObject) return;
+    const a = (i / galleryOrder.length) * Math.PI * 2 - Math.PI / 2;
+    modelGroups[type].position.set(Math.cos(a) * radius, 0, Math.sin(a) * radius * 0.35);
+    modelGroups[type].scale.setScalar(worldARActive ? 0.13 : 0.48);
+  });
+}
+function buildObject(type) {
+  if (!modelRoot) return;
+  currentObject = type;
+  activeGroup = modelGroups[type];
+  activeMixer = modelMixers.find(m => m.getRoot?.() === activeGroup?.children?.[0]) || null;
+  if (!activeGroup) { buildGallery(); return; }
+  focusSelectedModel(); updateCatalogSelection();
+}
+function selectObject(type, options = {}) {
+  if (!galleryOrder.includes(type)) return;
+  buildObject(type);
+  toast(`${modelMetadata[type]?.label || type} selected. Use hand gestures to manipulate.`);
+  if (!options.remote) scheduleSharedState();
+}
+async function loadGalleryModel(type, group) {
+  const filename = optionalModelFiles[type];
+  if (!filename) return;
+  try {
+    const gltf = await gltfLoader.loadAsync(`/models/${filename}`);
+    if (!group.parent) return;
+    while (group.children.length) {
+      const child = group.children.pop();
+      child.traverse?.(node => { node.geometry?.dispose?.(); if (node.material) (Array.isArray(node.material)?node.material:[node.material]).forEach(m=>m.dispose?.()); });
+    }
+    const model = gltf.scene;
+    const rotation = modelMetadata[type]?.rotation || [0,0,0];
+    model.rotation.set(...rotation);
+    model.traverse(object => { if (object.isMesh) { object.castShadow = true; object.frustumCulled = false; } });
+    let bounds = new THREE.Box3().setFromObject(model);
+    const size = bounds.getSize(new THREE.Vector3());
+    const largestSide = Math.max(size.x,size.y,size.z) || 1;
+    model.scale.setScalar(1.45/largestSide);
+    bounds = new THREE.Box3().setFromObject(model);
+    const center = bounds.getCenter(new THREE.Vector3());
+    model.position.x -= center.x; model.position.z -= center.z; model.position.y -= bounds.min.y;
+    group.add(model);
+    if (gltf.animations?.length) {
+      const mixer = new THREE.AnimationMixer(model);
+      mixer.clipAction(gltf.animations[0]).play();
+      modelMixers.push(mixer);
+      if (type === currentObject) activeMixer = mixer;
+    }
+  } catch (error) { console.error(`Could not load ${filename}:`, error); }
+}
+
+function animate() {
+  animationId = requestAnimationFrame(animate);
+  if (!renderer || !scene || !camera) return;
+  const delta = clock.getDelta();
+  modelMixers.forEach(mixer => mixer.update(Math.min(delta, 0.05)));
+  if (modelRoot) {
+    galleryOrder.forEach(type => {
+      const group = modelGroups[type];
+      if (!group) return;
+      if (type !== currentObject && autoRotate) group.rotation.y += 0.0035;
+      if (type === currentObject && autoRotate && !grabbed) group.rotation.y += 0.0015;
+    });
+    if (grabbed && activeGroup) activeGroup.position.lerp(handTarget, 0.28);
+  }
+  if (worldARActive && zapparCamera) {
+    zapparCamera.updateFrame(renderer);
+    if (!worldARPlaced && worldTracker) worldTracker.setAnchorPoseFromCameraOffset(0, 0, -2.5);
+    renderer.render(scene, zapparCamera);
+  } else {
+    renderer.render(scene, camera);
+    if (video.readyState >= 2 && gestureOn && performance.now()-lastDetect>40) detectHands();
+    if (video.readyState >= 2 && currentMode==='mirror' && performance.now()-lastFaceDetect>90) detectFace();
+  }
+}
+// Camera-canvas pointer manipulation is intentionally disabled: all object manipulation is gesture-only.
+function normalizedToWorld(x,y,z=0) {
+  const distance = worldARActive ? 1.25 : 4.8;
+  const height = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * distance;
+  const width = height * camera.aspect;
+  return new THREE.Vector3((x - 0.5) * width, (0.5 - y) * height, THREE.MathUtils.clamp(-z * 2.2, -1.4, 1.4));
+}
+async function enableGestures() {
+  if (worldARActive) { toast('Exit Surface AR before enabling hand tracking.'); return; }
+  if (!stream || cameraFacing !== 'environment') { toast('Switch to the rear camera first.'); return; }
+  try {
+    if (!handLandmarker) {
+      toast('Loading hand tracking AI…');
+      const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+      const handOptions = {
+        baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate: 'GPU' },
+        runningMode: 'VIDEO', numHands: 2
+      };
+      try { handLandmarker = await HandLandmarker.createFromOptions(vision, handOptions); }
+      catch { handOptions.baseOptions.delegate = 'CPU'; handLandmarker = await HandLandmarker.createFromOptions(vision, handOptions); }
+    }
+    gestureOn = !gestureOn;
+    $('#gestureStatus').textContent = gestureOn ? 'ON' : 'OFF';
+    $('#gestureStatus').style.color = gestureOn ? '#59ffc0' : '#ffbd62';
+    $('#gestureBtn').textContent = gestureOn ? 'DISABLE HAND CONTROL' : 'ENABLE HAND CONTROL';
+    $('#gestureDescription').textContent = gestureOn ? 'Pinch to grab and move. Turn your wrist to rotate; use both hands to scale and rotate. Open your hand to release.' : 'Enable gesture control to move the hologram without touching the screen.';
+    toast(gestureOn ? 'Hand tracking enabled. Show your hand!' : 'Hand tracking disabled.');
+  } catch (err) {
+    console.error(err); toast('Hand tracking could not load. Check camera permission and reload.');
+  }
+}
+function detectHands() {
+  lastDetect = performance.now();
+  try {
+    const result = handLandmarker.detectForVideo(video, lastDetect);
+    const hands = result.landmarks || [];
+    if (!hands.length) { grabbed=false; handWasPinching=false; handLastPoint=null; twoHandBaseline=null; gestureHint.textContent='Show your hand to the camera'; return; }
+    const primary = hands[0];
+    const thumb=primary[4], index=primary[8], wrist=primary[0], middleMcp=primary[9], pinkyMcp=primary[17];
+    const distance=Math.hypot(thumb.x-index.x,thumb.y-index.y);
+    const pinch=distance<0.055;
+    const point=normalizedToWorld(index.x,index.y,index.z || 0);
+    if (pinch && !handWasPinching) {
+      grabbed=true; handLastPoint=point.clone();
+      if (activeGroup) handTarget.copy(activeGroup.position);
+      gestureHint.textContent='OBJECT GRABBED · MOVE YOUR HAND';
+    } else if (pinch && grabbed && handLastPoint) {
+      // Delta-based tracking prevents the old mirrored/inverted absolute mapping.
+      const dx=(handLastPoint.x-point.x); // corrected below using camera image coordinates
+      const dy=(point.y-handLastPoint.y);
+      handTarget.x += -dx;
+      handTarget.y += dy;
+      handTarget.z = point.z;
+      // Wrist/palm orientation provides pitch and roll control on all three axes.
+      const palmAngle=Math.atan2(pinkyMcp.y-index.y, pinkyMcp.x-index.x);
+      const palmTilt=Math.atan2(middleMcp.y-wrist.y, Math.max(0.001, middleMcp.x-wrist.x));
+      activeGroup.rotation.z = THREE.MathUtils.lerp(activeGroup.rotation.z, -palmAngle, 0.22);
+      activeGroup.rotation.x = THREE.MathUtils.lerp(activeGroup.rotation.x, THREE.MathUtils.clamp((palmTilt-1.2)*1.5,-Math.PI,Math.PI),0.18);
+      handLastPoint.copy(point);
+      gestureHint.textContent='MOVE · TILT · ROTATE';
+    }
+    if (!pinch && handWasPinching) { grabbed=false; handLastPoint=null; gestureHint.textContent='OBJECT RELEASED · PINCH TO GRAB'; }
+    handWasPinching=pinch;
+    if (hands.length >= 2) {
+      const a=hands[0][8], b=hands[1][8];
+      const span=Math.hypot(a.x-b.x,a.y-b.y);
+      const angle=Math.atan2(b.y-a.y,b.x-a.x);
+      if (!twoHandBaseline) twoHandBaseline={span,angle,scale:activeGroup?.scale.x||1,rotation:activeGroup?.rotation.y||0};
+      if (activeGroup && hands[0][4] && hands[1][4]) {
+        const bothPinched = Math.hypot(hands[0][4].x-a.x,hands[0][4].y-a.y)<0.07 && Math.hypot(hands[1][4].x-b.x,hands[1][4].y-b.y)<0.07;
+        if (bothPinched) {
+          activeGroup.scale.setScalar(THREE.MathUtils.clamp(twoHandBaseline.scale*(span/Math.max(0.05,twoHandBaseline.span)),0.08,2.5));
+          activeGroup.rotation.y=twoHandBaseline.rotation+(angle-twoHandBaseline.angle);
+          gestureHint.textContent='TWO HANDS · SCALE + 3D ROTATION';
+        } else twoHandBaseline=null;
+      }
+    } else twoHandBaseline=null;
+  } catch(err) { console.warn('Hand tracking frame failed',err); }
+}
+async function startWorldAR() {
+  if (worldARActive) return;
+  if (!renderer) initThree();
+
+  // Android Chrome can use native WebXR hit-testing for actual detected surfaces.
+  // Call requestSession directly from the tap handler so the browser's user activation is retained.
+  let nativeSession = null;
+  const isAndroid = /Android/i.test(navigator.userAgent);
+  if (isAndroid && navigator.xr?.requestSession) {
+    try {
+      nativeSession = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'],
+        optionalFeatures: ['dom-overlay'],
+        domOverlay: { root: document.body }
+      });
+    } catch (error) {
+      console.info('WebXR hit-test is not available; trying the cross-browser tracking engine.', error);
+    }
+  }
+
+  if (nativeSession) {
+    try {
+      await activateWebXRSurfaceSession(nativeSession);
+      return;
+    } catch (error) {
+      console.error('WebXR surface AR failed:', error);
+      try { await nativeSession.end(); } catch { /* best effort */ }
+      // A failure can happen after the renderer was switched to XR mode.
+      // Restore the ordinary camera-overlay renderer before trying the fallback.
+      finishWebXRSession();
+      toast('Native surface tracking failed. Trying the browser AR engine…');
+    }
+  }
+
+  const ZapparThree = window.ZapparThree || await zapparSdkPreload;
+  if (!ZapparThree?.Camera || !ZapparThree?.InstantWorldTracker || !ZapparThree?.InstantWorldAnchorGroup) {
+    toast('Markerless AR engine is unavailable. Check the SDK connection and license setup.');
+    return;
+  }
+  try {
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+      video.srcObject = null;
+    }
+    if (ZapparThree.browserIncompatible?.()) {
+      ZapparThree.browserIncompatibleUI?.();
+      return;
+    }
+
+    $('#worldArStatus').textContent = 'REQUESTING';
+    const granted = await ZapparThree.permissionRequest();
+    if (!granted) throw new Error('Camera and motion permissions are required for surface AR.');
+
+    ZapparThree.glContextSet(renderer.getContext());
+    zapparCamera = new ZapparThree.Camera();
+    scene.background = zapparCamera.backgroundTexture;
+    zapparCamera.start();
+
+    worldTracker = new ZapparThree.InstantWorldTracker();
+    worldAnchorGroup = new ZapparThree.InstantWorldAnchorGroup(zapparCamera, worldTracker);
+    scene.add(worldAnchorGroup);
+    scene.remove(modelRoot);
+    worldAnchorGroup.add(modelRoot);
+    modelRoot.position.set(0, 0, 0);
+    modelRoot.rotation.set(0, 0, 0);
+    worldARActive = true;
+    focusSelectedModel();
+    worldARMode = 'zappar';
+    worldARPlaced = false;
+    video.classList.add('hidden');
+    cameraMessage.classList.add('hidden');
+    cameraLabel.textContent = 'WORLD TRACKING ACTIVE';
+    $('#worldArStatus').textContent = 'SCANNING';
+    $('#worldArBtn').classList.add('hidden');
+    $('#placeWorldObjectBtn').classList.remove('hidden');
+    $('#stopWorldArBtn').classList.remove('hidden');
+    $('#placeWorldObjectBtn').textContent = 'PLACE OBJECT';
+    $('#tipText').textContent = 'Move your phone slowly to map the room, aim at a surface, then place the object.';
+    toast('World tracking active. Slowly scan the room before placing the model.');
+  } catch (error) {
+    console.error('Surface AR start failed:', error);
+    zapparCamera?.stop?.();
+    zapparCamera = null;
+    $('#worldArStatus').textContent = 'STANDBY';
+    if (scene) scene.background = null;
+    cameraMessage.classList.remove('hidden');
+    toast(error.message || 'Could not start surface AR on this device.');
+  }
+}
+
+async function activateWebXRSurfaceSession(session) {
+  if (stream) {
+    stream.getTracks().forEach((track) => track.stop());
+    stream = null;
+    video.srcObject = null;
+  }
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+  worldArSession = session;
+  worldArLocalSpace = await session.requestReferenceSpace('local');
+  const viewerSpace = await session.requestReferenceSpace('viewer');
+  worldArHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+  worldArReticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.09, 0.13, 36),
+    new THREE.MeshBasicMaterial({ color: 0x53e8ff, side: THREE.DoubleSide })
+  );
+  worldArReticle.rotation.x = -Math.PI / 2;
+  worldArReticle.matrixAutoUpdate = false;
+  worldArReticle.visible = false;
+  scene.add(worldArReticle);
+  modelRoot.visible = false;
+  worldARActive = true;
+  focusSelectedModel();
+  worldARMode = 'webxr';
+  worldARPlaced = false;
+  video.classList.add('hidden');
+  cameraMessage.classList.add('hidden');
+  cameraLabel.textContent = 'WEBXR SURFACE TRACKING';
+  $('#worldArStatus').textContent = 'SCANNING SURFACES';
+  $('#worldArBtn').classList.add('hidden');
+  $('#placeWorldObjectBtn').classList.remove('hidden');
+  $('#stopWorldArBtn').classList.remove('hidden');
+  $('#placeWorldObjectBtn').textContent = 'PLACE OBJECT';
+  $('#tipText').textContent = 'Move the phone to detect a real surface. Aim at the reticle and tap PLACE OBJECT.';
+
+  if (animationId) { cancelAnimationFrame(animationId); animationId = null; }
+  let lastXRFrameTime = 0;
+  renderer.setAnimationLoop((time, frame) => {
+    if (!frame || !worldArHitTestSource || !worldArLocalSpace) return;
+    const xrDelta = lastXRFrameTime ? Math.min((time - lastXRFrameTime) / 1000, 0.05) : 0;
+    lastXRFrameTime = time;
+    modelMixers.forEach(mixer => mixer.update(xrDelta));
+    const hits = frame.getHitTestResults(worldArHitTestSource);
+    if (!worldARPlaced && hits.length) {
+      const pose = hits[0].getPose(worldArLocalSpace);
+      if (pose && worldArReticle) {
+        worldArReticle.visible = true;
+        worldArReticle.matrix.fromArray(pose.transform.matrix);
+        worldArReticle.matrixWorldNeedsUpdate = true;
+      }
+    } else if (worldArReticle) {
+      worldArReticle.visible = false;
+    }
+    if (modelRoot && worldARPlaced && autoRotate) galleryOrder.forEach(type => { const g=modelGroups[type]; if(g && type !== currentObject) g.rotation.y += 0.0035; });
+    renderer.render(scene, camera);
+  });
+
+  session.addEventListener('select', lockWebXRPlacement);
+  session.addEventListener('end', finishWebXRSession, { once: true });
+  toast('Surface detection ready. Move the phone slowly until the reticle appears.');
+}
+
+function lockWebXRPlacement() {
+  if (worldARMode !== 'webxr' || worldARPlaced || !worldArReticle?.visible || !modelRoot) return;
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  const ignoredScale = new THREE.Vector3();
+  worldArReticle.matrix.decompose(position, quaternion, ignoredScale);
+  modelRoot.position.copy(position);
+  modelRoot.quaternion.copy(quaternion);
+  modelRoot.visible = true;
+  worldARPlaced = true;
+  $('#worldArStatus').textContent = 'ANCHORED LOCALLY';
+  $('#placeWorldObjectBtn').textContent = 'REPOSITION OBJECT';
+  $('#tipText').textContent = 'Object is anchored to this device’s detected surface. Classroom sync shares model edits, not physical coordinates.';
+  toast('Object placed on the detected surface.');
+}
+
+function toggleWorldPlacement() {
+  if (!worldARActive) return;
+  if (worldARMode === 'webxr') {
+    if (worldARPlaced) {
+      worldARPlaced = false;
+      modelRoot.visible = false;
+      $('#worldArStatus').textContent = 'SCANNING SURFACES';
+      $('#placeWorldObjectBtn').textContent = 'PLACE OBJECT';
+      return;
+    }
+    lockWebXRPlacement();
+    return;
+  }
+  if (!worldTracker) return;
+  worldARPlaced = !worldARPlaced;
+  $('#worldArStatus').textContent = worldARPlaced ? 'ANCHORED LOCALLY' : 'SCANNING';
+  $('#placeWorldObjectBtn').textContent = worldARPlaced ? 'REPOSITION OBJECT' : 'PLACE OBJECT';
+  $('#tipText').textContent = worldARPlaced
+    ? 'Object anchored in this phone’s local world map. Room controls sync model settings, not physical coordinates.'
+    : 'Aim at the desired location and tap PLACE OBJECT.';
+  toast(worldARPlaced ? 'Object placement fixed on this device.' : 'Choose a new placement point.');
+}
+
+function finishWebXRSession() {
+  if (renderer) renderer.setAnimationLoop(null);
+  try { worldArHitTestSource?.cancel?.(); } catch { /* session may already be closed */ }
+  if (worldArReticle) scene?.remove(worldArReticle);
+  worldArReticle = null;
+  worldArHitTestSource = null;
+  worldArLocalSpace = null;
+  worldArSession = null;
+  worldARActive = false;
+  focusSelectedModel();
+  worldARMode = null;
+  worldARPlaced = false;
+  if (renderer) renderer.xr.enabled = false;
+  if (modelRoot) modelRoot.visible = true;
+  $('#worldArStatus').textContent = 'STANDBY';
+  $('#worldArBtn').classList.remove('hidden');
+  $('#placeWorldObjectBtn').classList.add('hidden');
+  $('#stopWorldArBtn').classList.add('hidden');
+  $('#cameraLabel').textContent = 'CAMERA STANDBY';
+  cameraMessage.classList.remove('hidden');
+  if (!animationId) animate();
+}
+
+async function stopWorldAR(options = {}) {
+  if (worldARMode === 'webxr' && worldArSession) {
+    const session = worldArSession;
+    try { await session.end(); } catch (error) { console.warn('WebXR session end failed', error); }
+    finishWebXRSession();
+    if (!options.silent) toast('Surface AR closed.');
+    return;
+  }
+  if (!worldARActive && !zapparCamera) return;
+  worldARActive = false;
+  focusSelectedModel();
+  worldARMode = null;
+  worldARPlaced = false;
+  try { zapparCamera?.stop?.(); } catch (error) { console.warn('Zappar camera stop failed', error); }
+  if (worldAnchorGroup && modelRoot) {
+    worldAnchorGroup.remove(modelRoot);
+    scene?.remove(worldAnchorGroup);
+    scene?.add(modelRoot);
+  }
+  zapparCamera = null;
+  worldTracker = null;
+  worldAnchorGroup = null;
+  if (scene) scene.background = null;
+  video.classList.remove('hidden');
+  $('#worldArStatus').textContent = 'STANDBY';
+  $('#worldArBtn').classList.remove('hidden');
+  $('#placeWorldObjectBtn').classList.add('hidden');
+  $('#stopWorldArBtn').classList.add('hidden');
+  $('#cameraLabel').textContent = 'CAMERA STANDBY';
+  cameraMessage.classList.remove('hidden');
+  if (!options.silent) toast('Surface AR closed.');
+}
+
+function getSharedObjectState() {
+  if (!activeGroup) return null;
+  return {
+    objectType: currentObject,
+    scale: Number($('#scaleSlider').value) / 100,
+    rotationX: activeGroup.rotation.x,
+    rotationY: activeGroup.rotation.y,
+    rotationZ: activeGroup.rotation.z,
+    autoRotate
+  };
+}
+
+function scheduleSharedState() {
+  if (applyingRemoteState || !getActiveRoom()) return;
+  clearTimeout(roomPublishTimer);
+  roomPublishTimer = setTimeout(async () => {
+    const state = getSharedObjectState();
+    if (!state) return;
+    try { await publishRoomState(state); }
+    catch (error) { console.error('Could not publish classroom state:', error); setRoomMessage(error.message, true); }
+  }, 220);
+}
+
+function applyRemoteRoomState(state) {
+  if (!state || typeof state !== 'object') return;
+  applyingRemoteState = true;
+  try {
+    if (state.objectType && state.objectType !== currentObject) selectObject(state.objectType, { remote: true });
+    if (activeGroup) {
+      const factor = worldARActive ? 0.35 : 1;
+      const scale = Math.min(1.8, Math.max(0.5, Number(state.scale) || 1));
+      $('#scaleSlider').value = Math.round(scale * 100);
+      $('#scaleValue').textContent = `${Math.round(scale * 100)}%`;
+      activeGroup.scale.setScalar(scale * factor);
+      activeGroup.rotation.set(Number(state.rotationX) || 0, Number(state.rotationY) || 0, Number(state.rotationZ) || 0);
+      if (worldARActive) activeGroup.position.y = 0.45;
+    }
+    if (typeof state.autoRotate === 'boolean') autoRotate = state.autoRotate;
+  } finally {
+    applyingRemoteState = false;
+  }
+}
+
+function setRoomMessage(message, isError = false) {
+  const node = $('#roomMessage');
+  node.textContent = message;
+  node.style.color = isError ? '#ff9f9f' : '';
+}
+
+function renderParticipants(participants = []) {
+  const list = $('#participantList');
+  list.replaceChildren();
+  if (!participants.length) {
+    list.textContent = 'Waiting for participants…';
+    return;
+  }
+  participants.forEach((person) => {
+    const row = document.createElement('div');
+    row.className = 'participant-entry';
+    const name = document.createElement('span');
+    name.textContent = person.name || 'Student';
+    const role = document.createElement('small');
+    role.textContent = person.role || 'student';
+    row.append(name, role);
+    list.append(row);
+  });
+}
+
+async function showRoomInvite(room) {
+  $('#roomSharePanel').classList.remove('hidden');
+  $('#activeRoomCode').textContent = room.code;
+  $('#roomCodeInput').value = room.code;
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', room.code);
+  try {
+    await QRCode.toCanvas($('#roomQrCanvas'), url.toString(), {
+      width: 176, margin: 1,
+      color: { dark: '#061626', light: '#ffffff' },
+      errorCorrectionLevel: 'M'
+    });
+  } catch (error) { console.error('QR generation failed:', error); }
+}
+
+async function handleCreateRoom() {
+  const displayName = $('#displayName').value.trim();
+  if (!displayName) { setRoomMessage('Enter your name first.', true); $('#displayName').focus(); return; }
+  if (!collaborationConfigured) { setRoomMessage('Supabase is not configured. Add the environment variables and run the SQL migration.', true); return; }
+  $('#createRoomBtn').disabled = true;
+  try {
+    const connected = await createSharedRoom($('#roomTitle').value.trim(), displayName);
+    await showRoomInvite(connected.room);
+    $('#roomStatus').textContent = 'LIVE';
+    $('#roomStatus').style.color = '#59ffc0';
+    setRoomMessage(`You are hosting “${connected.room.title}”. Share the QR or invitation link.`);
+    const state = await loadRoomState();
+    if (state) applyRemoteRoomState(state);
+    toast('Classroom created. Invite your students!');
+  } catch (error) {
+    console.error('Create room failed:', error);
+    setRoomMessage(error.message || 'Could not create the classroom.', true);
+  } finally { $('#createRoomBtn').disabled = false; }
+}
+
+async function handleJoinRoom() {
+  const displayName = $('#displayName').value.trim();
+  const code = $('#roomCodeInput').value.trim();
+  if (!displayName) { setRoomMessage('Enter your name first.', true); $('#displayName').focus(); return; }
+  if (!collaborationConfigured) { setRoomMessage('Supabase is not configured. Add the environment variables and run the SQL migration.', true); return; }
+  $('#joinRoomBtn').disabled = true;
+  try {
+    const connected = await joinSharedRoom(code, displayName);
+    await showRoomInvite(connected.room);
+    $('#roomStatus').textContent = 'LIVE';
+    $('#roomStatus').style.color = '#59ffc0';
+    setRoomMessage(`Connected to “${connected.room.title}”. The shared model state is live.`);
+    const state = await loadRoomState();
+    if (state) applyRemoteRoomState(state);
+    toast(`Joined classroom ${connected.room.code}.`);
+  } catch (error) {
+    console.error('Join room failed:', error);
+    setRoomMessage(error.message || 'Could not join the classroom.', true);
+  } finally { $('#joinRoomBtn').disabled = false; }
+}
+
+async function copyRoomInvite() {
+  const room = getActiveRoom();
+  if (!room) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', room.code);
+  try {
+    await navigator.clipboard.writeText(url.toString());
+    toast('Classroom invitation link copied.');
+  } catch {
+    setRoomMessage(`Copy this invitation link: ${url.toString()}`, true);
+  }
+}
+
+async function handleLeaveRoom() {
+  try { await leaveSharedRoom(); } catch (error) { console.warn(error); }
+  $('#roomSharePanel').classList.add('hidden');
+  $('#roomStatus').textContent = 'OFFLINE';
+  $('#roomStatus').style.color = '';
+  renderParticipants([]);
+  setRoomMessage('You left the classroom.');
+  toast('Classroom disconnected.');
+}
+
+onRoomEvent('participants', renderParticipants);
+onRoomEvent('state', applyRemoteRoomState);
+onRoomEvent('disconnected', () => {
+  $('#roomStatus').textContent = 'OFFLINE';
+  $('#roomStatus').style.color = '';
+});
+
+const invitedRoomCode = new URLSearchParams(window.location.search).get('room');
+if (invitedRoomCode) $('#roomCodeInput').value = invitedRoomCode.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+if (!collaborationConfigured) {
+  $('#roomStatus').textContent = 'SETUP';
+  setRoomMessage('Add Supabase URL and publishable key to enable shared classrooms.');
+}
+
+async function loadFaceModel() {
+  try {
+    if (!faceLandmarker) {
+      const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+      const faceOptions = {
+        baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:'GPU'},
+        runningMode:'VIDEO',numFaces:1
+      };
+      try { faceLandmarker = await FaceLandmarker.createFromOptions(vision, faceOptions); }
+      catch { faceOptions.baseOptions.delegate = 'CPU'; faceLandmarker = await FaceLandmarker.createFromOptions(vision, faceOptions); }
+    }
+    toast('Face tracking ready. Look at the camera.');
+  } catch(err) { console.error(err); toast('Face tracking unavailable. Check your connection.'); }
+}
+function detectFace() {
+  lastFaceDetect=performance.now();
+  if(!faceLandmarker) return;
+  const ctx=faceCanvas.getContext('2d');
+  const w=faceCanvas.clientWidth,h=faceCanvas.clientHeight;
+  if(faceCanvas.width!==w*devicePixelRatio||faceCanvas.height!==h*devicePixelRatio){faceCanvas.width=w*devicePixelRatio;faceCanvas.height=h*devicePixelRatio;}
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);ctx.clearRect(0,0,w,h);
+  try{
+    const res=faceLandmarker.detectForVideo(video,lastFaceDetect);
+    const pts=res.faceLandmarks?.[0]; if(!pts)return;
+    const x=p=>(1-p.x)*w, y=p=>p.y*h;
+    ctx.strokeStyle='#63e8ff';ctx.fillStyle='#63e8ff';ctx.lineWidth=2.2;ctx.shadowColor='#39dfff';ctx.shadowBlur=14;
+    const left=pts[33],right=pts[263],nose=pts[1],forehead=pts[10],chin=pts[152];
+    const eyeY=(y(pts[159])+y(pts[386]))/2;
+    const centerX=(x(left)+x(right))/2;
+    if(selectedEffect==='visor'){
+      ctx.beginPath();ctx.moveTo(x(left)-17,eyeY-7);ctx.lineTo(x(right)+17,eyeY-7);ctx.lineTo(x(right)+8,eyeY+25);ctx.lineTo(centerX,eyeY+34);ctx.lineTo(x(left)-8,eyeY+25);ctx.closePath();
+      const grad=ctx.createLinearGradient(0,eyeY,0,eyeY+40);grad.addColorStop(0,'rgba(50,220,255,.65)');grad.addColorStop(1,'rgba(15,70,140,.25)');ctx.fillStyle=grad;ctx.fill();ctx.stroke();
+      ctx.fillStyle='#dfffff';ctx.font='10px monospace';ctx.fillText('CYBER VISOR',centerX-38,eyeY-14);
+    } else if(selectedEffect==='glasses'){
+      ctx.beginPath();ctx.ellipse(x(pts[33]),eyeY,23,14,0,0,Math.PI*2);ctx.ellipse(x(pts[263]),eyeY,23,14,0,0,Math.PI*2);ctx.moveTo(x(pts[33])+23,eyeY);ctx.lineTo(x(pts[263])-23,eyeY);ctx.stroke();
+    } else if(selectedEffect==='crown'){
+      ctx.beginPath();ctx.moveTo(x(forehead)-50,y(forehead)+25);ctx.lineTo(x(forehead)-35,y(forehead)-25);ctx.lineTo(centerX-12,y(forehead)+5);ctx.lineTo(centerX,y(forehead)-42);ctx.lineTo(centerX+15,y(forehead)+5);ctx.lineTo(x(forehead)+45,y(forehead)-25);ctx.lineTo(x(forehead)+55,y(forehead)+25);ctx.closePath();ctx.stroke();
+    } else if(selectedEffect==='scan'){
+      ctx.beginPath();ctx.ellipse(centerX,(y(forehead)+y(chin))/2,Math.abs(x(left)-x(right))*.75,Math.abs(y(chin)-y(forehead))*.7,0,0,Math.PI*2);ctx.stroke();
+      ctx.fillStyle='#8ff4ff';ctx.font='10px monospace';ctx.fillText('BIOMETRIC SCAN / ACTIVE',centerX-70,y(chin)+18);
+    }
+  }catch(err){console.warn('Face tracking frame failed',err);}
+}
