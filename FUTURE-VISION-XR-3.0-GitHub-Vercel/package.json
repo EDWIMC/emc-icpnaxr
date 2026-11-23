@@ -1,0 +1,20 @@
+{
+  "name": "future-vision-xr",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.14",
+    "@supabase/supabase-js": "^2.57.0",
+    "qrcode": "^1.5.4",
+    "three": "^0.157.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10"
+  }
+}

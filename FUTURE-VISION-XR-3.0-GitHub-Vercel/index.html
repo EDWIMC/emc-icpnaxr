@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#050914" />
+  <meta name="description" content="Future Vision XR — an interactive augmented technology experience." />
+  <title>FUTURE VISION XR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Future Vision XR home">
+        <span class="brand-mark">FV<span>×</span></span>
+        <span><b>FUTURE VISION</b><small>XR EXPERIENCE / 2050</small></span>
+      </a>
+      <div class="top-actions">
+        <span class="live-dot"></span><span class="live-label">SYSTEM ONLINE</span>
+        <button id="soundBtn" class="icon-btn" aria-label="Toggle sound" title="Toggle sound">♫</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="homeScreen" class="hero-screen">
+        <div class="hero-grid"></div>
+        <div class="hero-content">
+          <div class="eyebrow"><span></span> ENGLISH TECHNOLOGY EXHIBITION</div>
+          <h1>THE FUTURE<br><em>IS IN YOUR HANDS.</em></h1>
+          <p class="hero-copy">Explore artificial intelligence, robotics and augmented reality. Move beyond the screen and interact with tomorrow.</p>
+          <div class="hero-actions">
+            <button id="startBtn" class="primary-btn">START EXPERIENCE <span>↗</span></button>
+            <button id="howBtn" class="secondary-btn">HOW IT WORKS</button>
+          </div>
+          <div class="hero-meta"><span>01 / IMMERSIVE LAB</span><span>CAMERA-POWERED EXPERIENCE</span></div>
+        </div>
+        <div class="hero-art" aria-hidden="true">
+          <div class="orb orb-a"></div><div class="orb orb-b"></div>
+          <div class="ring ring-a"></div><div class="ring ring-b"></div>
+          <div class="holo-card"><span>AI CORE</span><div class="core-eye"></div><small>INTELLIGENCE / 2050</small></div>
+          <div class="float-tag tag-one">NEURAL NETWORK <b>99.8%</b></div>
+          <div class="float-tag tag-two">XR INTERFACE <b>ACTIVE</b></div>
+        </div>
+      </section>
+
+      <section id="howScreen" class="how-screen hidden">
+        <button class="back-link" data-back>← BACK</button>
+        <p class="eyebrow">QUICK GUIDE</p><h2>HOW TO EXPLORE</h2>
+        <div class="guide-grid">
+          <article><b>01</b><h3>Choose a mode</h3><p>Use the rear camera for holograms or the front camera for the AR mirror.</p></article>
+          <article><b>02</b><h3>Allow camera access</h3><p>Open this website over HTTPS and grant camera permission.</p></article>
+          <article><b>03</b><h3>Move and interact</h3><p>Try hand gestures when available, or use the on-screen controls.</p></article>
+        </div>
+        <p class="note">For best results, use good lighting, keep your phone steady and close other apps.</p>
+      </section>
+
+      <section id="labScreen" class="lab-screen hidden">
+        <div class="lab-heading">
+          <div><p class="eyebrow">FUTURE VISION / INTERACTIVE LAB</p><h2 id="modeTitle">HOLOGRAM LAB</h2></div>
+          <button id="exitBtn" class="secondary-btn compact">EXIT LAB</button>
+        </div>
+
+        <div class="mode-tabs">
+          <button class="mode-tab active" data-mode="hologram">01 / HOLOGRAMS</button>
+          <button class="mode-tab" data-mode="mirror">02 / AR MIRROR</button>
+          <button class="mode-tab" data-mode="stage">03 / 2050 WORLD</button>
+        </div>
+
+        <div class="workspace">
+          <div class="camera-stage" id="cameraStage">
+            <video id="cameraVideo" playsinline muted autoplay></video>
+            <canvas id="threeCanvas"></canvas>
+            <canvas id="faceCanvas"></canvas>
+            <div class="stage-vignette"></div>
+            <div class="camera-hud"><span class="rec-dot"></span><span id="cameraLabel">CAMERA STANDBY</span><span class="hud-right">FUTURE VISION XR</span></div>
+            <div id="gestureHint" class="gesture-hint">Show one hand to the camera</div>
+            <div id="cameraMessage" class="camera-message">
+              <div class="camera-icon">◉</div>
+              <b>CAMERA NOT STARTED</b>
+              <span>Start the camera to enter the experience.</span>
+              <button id="cameraStartBtn" class="primary-btn">ACTIVATE CAMERA</button>
+            </div>
+          </div>
+
+          <aside class="control-panel">
+            <div class="panel-head"><span>CONTROL DECK</span><span class="panel-status">● READY</span></div>
+            <div id="hologramControls">
+              <label class="field-label">SELECT HOLOGRAM</label>
+              <div class="object-grid">
+                <button class="object-btn selected" data-object="robot"><span>🤖</span><b>ROBOT</b></button>
+                <button class="object-btn" data-object="brain"><span>🧠</span><b>AI BRAIN</b></button>
+                <button class="object-btn" data-object="car"><span>🚘</span><b>FUTURE CAR</b></button>
+                <button class="object-btn" data-object="phone"><span>📱</span><b>SMARTPHONE</b></button>
+                <button class="object-btn" data-object="satellite"><span>🛰️</span><b>SATELLITE</b></button>
+                <button class="object-btn" data-object="city"><span>🌆</span><b>SMART CITY</b></button>
+              </div>
+              <div class="control-block">
+                <div class="control-title"><span>OBJECT SCALE</span><output id="scaleValue">100%</output></div>
+                <input id="scaleSlider" type="range" min="50" max="180" value="100">
+              </div>
+              <div class="control-buttons">
+                <button id="rotateBtn" class="small-control">↻ ROTATE</button>
+                <button id="resetBtn" class="small-control">◎ RESET</button>
+              </div>
+              <div class="world-ar-card">
+                <div class="gesture-card-title">✦ SURFACE AR <span id="worldArStatus">STANDBY</span></div>
+                <p>Markerless local AR. Android may use detected planes; iPhone uses local world tracking. This release does not align the same physical point across phones.</p>
+                <button id="worldArBtn" class="outline-btn full">START SURFACE AR</button>
+                <button id="placeWorldObjectBtn" class="outline-btn full hidden">PLACE OBJECT</button>
+                <button id="stopWorldArBtn" class="outline-btn full hidden">EXIT SURFACE AR</button>
+              </div>
+              <div class="gesture-card">
+                <div class="gesture-card-title">✦ HAND TRACKING <span id="gestureStatus">OFF</span></div>
+                <p id="gestureDescription">Enable gesture control to move the hologram without touching the screen.</p>
+                <button id="gestureBtn" class="outline-btn">ENABLE HAND CONTROL</button>
+              </div>
+              <div class="collab-card">
+                <div class="gesture-card-title">✦ COLLABORATIVE CLASSROOM <span id="roomStatus">OFFLINE</span></div>
+                <p class="panel-copy">Create a room or join with an 8-character code. Object selection and model settings sync live.</p>
+                <label class="mini-label" for="displayName">YOUR NAME</label>
+                <input id="displayName" class="panel-input" maxlength="32" placeholder="Student name" autocomplete="name">
+                <label class="mini-label" for="roomTitle">CLASSROOM NAME</label>
+                <input id="roomTitle" class="panel-input" maxlength="70" placeholder="Science Lab / Group 1">
+                <button id="createRoomBtn" class="outline-btn full">CREATE CLASSROOM</button>
+                <div class="room-divider"><span>OR JOIN AN EXISTING ROOM</span></div>
+                <input id="roomCodeInput" class="panel-input room-code-input" maxlength="8" placeholder="8-CHARACTER CODE" autocapitalize="characters" spellcheck="false">
+                <button id="joinRoomBtn" class="outline-btn full">JOIN CLASSROOM</button>
+                <div id="roomSharePanel" class="room-share hidden">
+                  <div class="room-code-line"><span>ROOM CODE</span><strong id="activeRoomCode">--------</strong></div>
+                  <canvas id="roomQrCanvas" width="176" height="176" aria-label="Classroom invitation QR code"></canvas>
+                  <button id="copyRoomLinkBtn" class="outline-btn full">COPY INVITATION LINK</button>
+                  <div id="participantList" class="participant-list">Waiting for participants…</div>
+                  <button id="leaveRoomBtn" class="text-btn leave-room-btn">LEAVE CLASSROOM</button>
+                </div>
+                <p id="roomMessage" class="room-message" role="status">Set Supabase environment variables to enable shared classrooms.</p>
+                <p class="anchor-disclaimer">PHYSICAL ANCHOR NOTE: each device tracks its own room origin. Exact same-table alignment across phones needs a shared spatial map/VPS or a common reference.</p>
+              </div>
+            </div>
+
+            <div id="mirrorControls" class="hidden">
+              <label class="field-label">FUTURE YOU / EFFECTS</label>
+              <div class="effect-list">
+                <button class="effect-btn active" data-effect="visor">◈ CYBER VISOR <span>ON</span></button>
+                <button class="effect-btn" data-effect="glasses">◎ NEON GLASSES</button>
+                <button class="effect-btn" data-effect="crown">✧ HOLOGRAM CROWN</button>
+                <button class="effect-btn" data-effect="scan">⌁ FACE SCANNER</button>
+                <button class="effect-btn" data-effect="none">× CLEAR EFFECTS</button>
+              </div>
+              <div class="gesture-card"><div class="gesture-card-title">FRONT CAMERA</div><p>Face effects are visual overlays. They do not physically change your hair, clothes or appearance.</p></div>
+            </div>
+
+            <div id="stageControls" class="hidden">
+              <label class="field-label">WORLD OF 2050</label>
+              <p class="panel-copy">Explore a miniature futuristic city and its connected systems.</p>
+              <button class="outline-btn full" id="cityBtn">SHOW SMART CITY</button>
+              <button class="outline-btn full" id="carBtn">SHOW AUTONOMOUS CAR</button>
+            </div>
+
+            <div class="panel-footer"><span>DESIGNED FOR LEARNING</span><span>EN / ES</span></div>
+          </aside>
+        </div>
+
+        <div class="bottom-bar">
+          <div class="tip"><span>✦</span><span id="tipText">Tip: select an object and use the scale slider.</span></div>
+          <div class="bottom-actions"><button id="switchCameraBtn" class="text-btn">SWITCH CAMERA</button><button id="fullscreenBtn" class="text-btn">⛶ FULL SCREEN</button></div>
+        </div>
+      </section>
+    </main>
+    <footer><span>FUTURE VISION XR</span><span>THE FUTURE IS IN YOUR HANDS.</span><span>EDWIN MAZA CASTRO · 2026</span></footer>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
