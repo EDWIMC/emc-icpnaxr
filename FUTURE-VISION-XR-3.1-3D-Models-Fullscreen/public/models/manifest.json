@@ -1,0 +1,58 @@
+[
+  {
+    "file": "cybertruck.glb",
+    "bytes": 229704,
+    "sizeMB": 0.22,
+    "meshes": 14,
+    "vertices": 18640,
+    "faces": 11526
+  },
+  {
+    "file": "falcon9-heavy.glb",
+    "bytes": 12069664,
+    "sizeMB": 11.51,
+    "meshes": 5,
+    "vertices": 196555,
+    "faces": 268164
+  },
+  {
+    "file": "mars.glb",
+    "bytes": 1096364,
+    "sizeMB": 1.05,
+    "meshes": 3,
+    "vertices": 10217,
+    "faces": 18720
+  },
+  {
+    "file": "moon.glb",
+    "bytes": 2694320,
+    "sizeMB": 2.57,
+    "meshes": 1,
+    "vertices": 33153,
+    "faces": 65536
+  },
+  {
+    "file": "robot.glb",
+    "bytes": 1841136,
+    "sizeMB": 1.76,
+    "meshes": 1,
+    "vertices": 7277,
+    "faces": 10506
+  },
+  {
+    "file": "satellite.glb",
+    "bytes": 4790268,
+    "sizeMB": 4.57,
+    "meshes": 8,
+    "vertices": 66690,
+    "faces": 65778
+  },
+  {
+    "file": "spacex-big-falcon.glb",
+    "bytes": 4016816,
+    "sizeMB": 3.83,
+    "meshes": 5,
+    "vertices": 32013,
+    "faces": 51140
+  }
+]
